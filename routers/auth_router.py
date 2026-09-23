@@ -30,6 +30,11 @@ def login(
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is inactive",
+        )
     expires = datetime.timedelta(minutes=auth.ACCESS_TOKEN_EXPIRE_MINUTES)
     token = auth.create_access_token(data={"sub": user.id, "role": user.role}, expires_delta=expires)
     return {"access_token": token, "token_type": "bearer", "user": user}

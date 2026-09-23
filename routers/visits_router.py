@@ -154,6 +154,7 @@ async def check_in(
 
     visit_status = "arrived"
     center = None
+    client = None
     center_id = payload.center_id if payload.center_id != "" else None
 
     if center_id:
@@ -173,6 +174,7 @@ async def check_in(
 
     existing_visit = db.query(models.Visit).filter(models.Visit.id == payload.visit_id).first()
     if existing_visit:
+        _assert_can_manage_visit(current_user, existing_visit.rep_id, db)
         existing_visit.status = visit_status
         db.commit()
         db.refresh(existing_visit)
@@ -228,6 +230,8 @@ async def create_visit(
                 status_to_save = "flagged"
 
     existing = db.query(models.Visit).filter(models.Visit.id == visit.id).first()
+    if existing:
+        _assert_can_manage_visit(current_user, existing.rep_id, db)
     interested_json = (
         json.dumps(visit.interested_product_ids) if visit.interested_product_ids else None
     )
@@ -271,8 +275,9 @@ async def create_visit(
             task.status = 'done'
             task.completed_at = datetime.datetime.utcnow()
             
-    db.commit()
-    db.refresh(new_visit)
+    # Keep the visit, item rows, and stock effects in one transaction. A
+    # retried request only inserts missing item rows, so stock is decremented
+    # once per visit/product.
     for item in visit.items:
         if db.query(models.VisitItem).filter(models.VisitItem.visit_id == new_visit.id, models.VisitItem.product_id == item.product_id).first():
             continue
@@ -281,12 +286,19 @@ async def create_visit(
         db.add(models.VisitItem(visit_id=new_visit.id, product_id=item.product_id, qty_sold=item.qty_sold, qty_free=item.qty_free, price_at_sale=price))
         if prod and item.qty_sold > 0:
             prod.stock_qty = max(0, prod.stock_qty - item.qty_sold)
-    db.commit()
-    db.refresh(new_visit)
     for req in visit.special_requests:
         if not db.query(models.SpecialRequest).filter(models.SpecialRequest.id == req.id).first():
-            db.add(models.SpecialRequest(id=req.id, visit_id=new_visit.id, request_type=req.request_type, description=req.description))
-    db.commit()
+            db.add(models.SpecialRequest(
+                id=req.id,
+                visit_id=new_visit.id,
+                request_type=req.request_type,
+                description=req.description,
+            ))
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(new_visit)
     enrich_visits([new_visit], db)
     if new_visit.status == "flagged" and current_user.supervisor_id:
@@ -330,11 +342,21 @@ async def create_visit(
 
 
 @router.get("/visits", response_model=List[schemas.VisitResponse])
-def get_visits(status: Optional[str] = None, brand_id: Optional[str] = None, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db)):
+def get_visits(
+    status: Optional[str] = None,
+    brand_id: Optional[str] = None,
+    rep_id: Optional[str] = None,
+    current_user: models.User = Depends(auth.require_password_set),
+    db: Session = Depends(get_db),
+):
     rep_ids = get_role_scoped_rep_ids(current_user, db)
     query = db.query(models.Visit)
     if rep_ids is not None:
         query = query.filter(models.Visit.rep_id.in_(rep_ids))
+    if rep_id:
+        if rep_ids is not None and rep_id not in rep_ids:
+            raise HTTPException(status_code=403, detail="Not authorized for this rep")
+        query = query.filter(models.Visit.rep_id == rep_id)
     if brand_id:
         query = query.filter(models.Visit.brand_id == brand_id)
     if status:
