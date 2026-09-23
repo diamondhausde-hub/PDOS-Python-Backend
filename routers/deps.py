@@ -128,20 +128,14 @@ def create_activity_log(
     db.commit()
 
 def generate_next_reference_code(db: Session, prefix: str) -> str:
-    """Atomically generates the next sequence number for a global reference code."""
-    # Ensure row exists
-    counter = db.query(models.SystemCounter).filter(models.SystemCounter.key == 'global_reference').first()
-    if not counter:
-        try:
-            db.execute(text("INSERT INTO system_counters (key, value) VALUES ('global_reference', 1000)"))
-            db.commit()
-        except Exception:
-            db.rollback() # Someone else inserted it first
-            
+    """Atomically generates the next sequence number in the caller's transaction."""
+    db.execute(text(
+        "INSERT INTO system_counters (key, value) VALUES ('global_reference', 1000) "
+        "ON CONFLICT (key) DO NOTHING"
+    ))
     # Atomic increment and return using RETURNING clause
     stmt = text("UPDATE system_counters SET value = value + 1 WHERE key = 'global_reference' RETURNING value")
     new_val = db.execute(stmt).scalar()
-    db.commit()
     return f"{prefix}-{new_val}"
 
 
