@@ -3,9 +3,10 @@ import datetime
 from typing import List, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from routers.deps import get_text
 
 import models, schemas, auth
 from database import get_db
@@ -30,6 +31,7 @@ def register_fcm_token(
     payload: schemas.FCMTokenCreate,
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     existing = db.query(models.FCMToken).filter(models.FCMToken.token == payload.token).first()
     if existing:
@@ -38,7 +40,7 @@ def register_fcm_token(
     else:
         db.add(models.FCMToken(user_id=current_user.id, token=payload.token))
     db.commit()
-    return {"message": "Token registered"}
+    return {"message": get_text("success_create", request)}
 
 
 @router.delete("/users/me/fcm-tokens")
@@ -46,13 +48,14 @@ def unregister_fcm_token(
     token: str,
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     db.query(models.FCMToken).filter(
         models.FCMToken.token == token,
         models.FCMToken.user_id == current_user.id,
     ).delete()
     db.commit()
-    return {"message": "Token unregistered"}
+    return {"message": get_text("success_delete", request)}
 
 
 # ── Profile & Location ───────────────────────────────────────
@@ -66,12 +69,13 @@ def update_my_location(
     payload: schemas.LocationUpdate,
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     current_user.last_lat = payload.lat
     current_user.last_lng = payload.lng
     current_user.last_location_update = datetime.datetime.now(datetime.timezone.utc)
     db.commit()
-    return {"message": "Location updated"}
+    return {"message": get_text("success_update", request)}
 
 
 @router.put("/users/me/password")
@@ -79,25 +83,26 @@ def update_password(
     data: dict,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user),
+    request: Request = None,
 ):
     new_password = data.get("password")
     if not new_password:
-        raise HTTPException(status_code=400, detail="Password is required")
+        raise HTTPException(status_code=400, detail=get_text("required_field", request))
     if len(new_password) < 8:
-        raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
+        raise HTTPException(status_code=422, detail=get_text("password_too_short", request))
     # SECURITY: require the current password for normal changes; the
     # first-login flow (temporary password) is exempt since the user just
     # authenticated with it.
     if not current_user.must_change_password:
         current_password = data.get("current_password")
         if not current_password:
-            raise HTTPException(status_code=400, detail="Current password is required")
+            raise HTTPException(status_code=400, detail=get_text("current_password_required", request))
         if not auth.verify_password(current_password, current_user.hashed_password):
-            raise HTTPException(status_code=403, detail="Current password is incorrect")
+            raise HTTPException(status_code=403, detail=get_text("incorrect_password", request))
     current_user.hashed_password = auth.get_password_hash(new_password)
     current_user.must_change_password = False
     db.commit()
-    return {"message": "Password updated successfully"}
+    return {"message": get_text("success_update", request)}
 
 
 @router.patch("/users/me/profile", response_model=schemas.UserResponse)
@@ -105,6 +110,7 @@ def update_own_profile(
     data: schemas.ProfileUpdate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if data.full_name is not None:
         current_user.full_name = data.full_name
@@ -116,17 +122,59 @@ def update_own_profile(
         current_user.profile_image_url = data.profile_image_url
     if data.current_password and data.new_password:
         if not auth.verify_password(data.current_password, current_user.hashed_password):
-            raise HTTPException(status_code=403, detail="Current password is incorrect")
+            raise HTTPException(status_code=403, detail=get_text("incorrect_password", request))
         current_user.hashed_password = auth.get_password_hash(data.new_password)
         current_user.must_change_password = False
     db.commit()
     db.refresh(current_user)
     return current_user
 
+@router.post("/users/{user_id}/upload-photo", response_model=schemas.UserResponse)
+async def upload_user_photo(
+    user_id: str,
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(auth.require_password_set),
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    # Authorization: Only the user themselves or an admin can upload the photo
+    if current_user.role != "admin" and current_user.id != user_id:
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail=get_text("invalid_file_type", request))
+
+    # Use the centralized store_file_locally helper for stability and deduplication
+    contents = await file.read()
+    if len(contents) > MAX_SIZE:
+        raise HTTPException(status_code=400, detail=get_text("file_too_large", request))
+
+    result = await store_file_locally(
+        file_bytes=contents,
+        mime_type=file.content_type,
+        subdir="profiles",
+        old_url=None, # Pass current_user.profile_image_url if you want to delete the old file
+        db=db
+    )
+
+    # Update user profile image URL
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=get_text("user_not_found", request))
+
+    user.profile_image_url = result["local_path"]
+    db.commit()
+    db.refresh(user)
+
+    return user
+
 # ── User Signatures ──────────────────────────────────────────
 from fastapi import UploadFile, File
 import os
 import shutil
+from routers.deps import store_file_locally
+
+# ... (keep other imports)
 
 @router.post("/users/me/signatures", response_model=schemas.UserSignatureResponse)
 async def upload_signature(
@@ -198,23 +246,24 @@ def create_user(
     payload: schemas.UserCreate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Only Admin can create users")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
 
     if payload.role in ("supervisor", "rep"):
         if not payload.brand_id:
-            raise HTTPException(status_code=422, detail="brand_id is required for supervisor and rep accounts")
+            raise HTTPException(status_code=422, detail=get_text("brand_id_required", request))
         brand = db.query(models.Brand).filter(models.Brand.id == payload.brand_id).first()
         if not brand:
-            raise HTTPException(status_code=404, detail="Brand not found")
+            raise HTTPException(status_code=404, detail=get_text("brand_not_found", request))
         if payload.role == "rep" and payload.supervisor_id:
             sup = db.query(models.User).filter(models.User.id == payload.supervisor_id).first()
             if not sup or sup.brand_id != payload.brand_id:
-                raise HTTPException(status_code=422, detail="Supervisor must belong to the same brand")
+                raise HTTPException(status_code=422, detail=get_text("supervisor_brand_mismatch", request))
     elif payload.role in ("admin", "general_manager"):
         if payload.brand_id:
-            raise HTTPException(status_code=422, detail="admin and general_manager accounts must not have a brand_id")
+            raise HTTPException(status_code=422, detail=get_text("no_brand_for_admin", request))
 
     new_user = models.User(
         id=str(uuid4()),
@@ -260,9 +309,10 @@ def get_team_directory(
     brand_id: Optional[str] = None,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if current_user.role not in ("admin", "general_manager"):
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     query = db.query(models.User).filter(models.User.role == "supervisor")
     if brand_id:
         query = query.filter(models.User.brand_id == brand_id)
@@ -300,12 +350,13 @@ def get_public_profile(
     user_id: str,
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     target = db.query(models.User).filter(models.User.id == user_id).first()
     if not target:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=get_text("user_not_found", request))
     if current_user.role != "general_manager" and current_user.brand_id != target.brand_id:
-        raise HTTPException(status_code=403, detail="Cross-brand profile access denied")
+        raise HTTPException(status_code=403, detail=get_text("cross_brand_access_denied", request))
 
     completed_visits = db.query(models.Visit).filter(
         models.Visit.rep_id == user_id, models.Visit.status == "completed"
@@ -351,18 +402,19 @@ def get_user_by_id(
     user_id: str,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=get_text("user_not_found", request))
     # SECURITY: role-scoped access (was IDOR — any rep could read any user,
     # including live GPS coordinates)
     if current_user.role == "rep":
         if user.id != current_user.id:
-            raise HTTPException(status_code=403, detail="Not authorized to view this user")
+            raise HTTPException(status_code=403, detail=get_text("not_authorized_view_user", request))
     elif current_user.role == "supervisor":
         if user.supervisor_id != current_user.id and user.id != current_user.id:
-            raise HTTPException(status_code=403, detail="Not authorized to view this user")
+            raise HTTPException(status_code=403, detail=get_text("not_authorized_view_user", request))
     return user
 
 
@@ -371,12 +423,13 @@ def request_deactivation(
     user_id: str,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     if current_user.role != "general_manager":
-        raise HTTPException(status_code=403, detail="Only general managers can request deactivation")
+        raise HTTPException(status_code=403, detail=get_text("gm_only_deactivation", request))
     target_user = db.query(models.User).filter(models.User.id == user_id).first()
     if not target_user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=get_text("user_not_found", request))
     for admin in db.query(models.User).filter(models.User.role == "admin").all():
         dispatch_notification_sync(
             db=db, user_id=admin.id, type="deactivation_request",
@@ -384,7 +437,7 @@ def request_deactivation(
             message=f"GM {current_user.full_name} requested to deactivate {target_user.full_name} ({target_user.email}).",
             related_id=user_id,
         )
-    return {"message": "Deactivation request sent to admins"}
+    return {"message": get_text("success_create", request)}
 
 
 @router.put("/users/{user_id}")
@@ -393,12 +446,13 @@ def update_user(
     data: schemas.UserUpdate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can update users")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=get_text("user_not_found", request))
     if data.full_name is not None: user.full_name = data.full_name
     if data.phone is not None: user.phone = data.phone
     if data.region is not None: user.region = data.region
@@ -407,10 +461,10 @@ def update_user(
     if data.has_completed_onboarding is not None: user.has_completed_onboarding = data.has_completed_onboarding
     if data.is_active is not None:
         if user_id == current_user.id and not data.is_active:
-            raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
+            raise HTTPException(status_code=400, detail=get_text("cannot_deactivate_self", request))
         user.is_active = data.is_active
     db.commit()
-    return {"message": "User updated"}
+    return {"message": get_text("success_update", request)}
 
 
 # ── Settings ─────────────────────────────────────────────────
@@ -428,9 +482,10 @@ def update_setting(
     payload: schemas.SystemSettingUpdate,
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     if key in SETTING_BOUNDS:
         low, high = SETTING_BOUNDS[key]
         try:

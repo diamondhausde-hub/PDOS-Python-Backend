@@ -91,6 +91,7 @@ def test_doctor_visit_flow():
     assert body["interested_product_ids"] == ["p1", "p2"]
 
     # 3. Supervisor + GM received the completion notification
+    db.expire_all()
     notifs_sup = db.query(models.Notification).filter(
         models.Notification.user_id == sup_id,
         models.Notification.type == "doctor_visit_completed",

@@ -1,9 +1,10 @@
 """routers/misc_router.py — notes, targets, brands, clients, field-reports, logs"""
 import datetime
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from routers.deps import get_text
 
 import models, schemas, auth
 from database import get_db
@@ -47,12 +48,13 @@ def send_note(
     payload: schemas.NoteCreate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     target = db.query(models.User).filter(models.User.id == user_id).first()
     if not target:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=get_text("user_not_found", request))
     if not _can_send_note_to(current_user, target):
-        raise HTTPException(status_code=403, detail="You can only send notes to your team members")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized_notes", request))
     note = models.Note(
         sender_id=current_user.id, recipient_id=user_id,
         content=payload.content, visit_id=payload.visit_id or None,
@@ -62,7 +64,7 @@ def send_note(
     db.refresh(note)
     dispatch_notification_sync(
         db, user_id=user_id, type="direct_note",
-        title=f"ملاحظة من {current_user.full_name}",
+        title=get_text("note_from_title", request).format(name=current_user.full_name),
         message=payload.content, related_id=note.id,
     )
     _note_response_models([note], db)
@@ -116,14 +118,14 @@ def list_notes(
 
 
 # ── Targets ──────────────────────────────────────────────────
-def _assert_can_manage_target(current_user: models.User, target_rep_id: str, db: Session):
+def _assert_can_manage_target(current_user: models.User, target_rep_id: str, db: Session, request: Request):
     if current_user.role == "admin":
         return
     if current_user.role == "supervisor":
         rep = db.query(models.User).filter(models.User.id == target_rep_id).first()
         if rep and rep.supervisor_id == current_user.id:
             return
-    raise HTTPException(status_code=403, detail="Not authorized for this rep")
+    raise HTTPException(status_code=403, detail=get_text("not_authorized_rep", request))
 
 
 @router.get("/targets", response_model=List[schemas.TargetResponse])
@@ -158,8 +160,9 @@ def create_target(
     payload: schemas.TargetCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
-    _assert_can_manage_target(current_user, payload.rep_id, db)
+    _assert_can_manage_target(current_user, payload.rep_id, db, request)
     t = models.Target(
         product_id=payload.product_id, rep_id=payload.rep_id,
         period_start=payload.period_start, period_end=payload.period_end,
@@ -177,14 +180,15 @@ def create_bulk_targets(
     payload: schemas.TargetBulkCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     if current_user.role not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     created_ids = []
     for rep_id in payload.rep_ids:
         # Same authorization as single-target creation — supervisors may
         # only assign targets to their own reps.
-        _assert_can_manage_target(current_user, rep_id, db)
+        _assert_can_manage_target(current_user, rep_id, db, request)
         t = models.Target(
             product_id=payload.product_id, rep_id=rep_id,
             period_start=payload.period_start, period_end=payload.period_end,
@@ -194,7 +198,7 @@ def create_bulk_targets(
         db.flush()
         created_ids.append(t.id)
     db.commit()
-    return {"message": f"Created {len(created_ids)} targets", "target_ids": created_ids}
+    return {"message": get_text("success_create", request), "target_ids": created_ids}
 
 
 @router.put("/targets/{target_id}", response_model=schemas.TargetResponse)
@@ -203,11 +207,12 @@ def update_target(
     payload: schemas.TargetUpdate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     t = db.query(models.Target).filter(models.Target.id == target_id).first()
     if not t:
-        raise HTTPException(status_code=404, detail="Target not found")
-    _assert_can_manage_target(current_user, t.rep_id, db)
+        raise HTTPException(status_code=404, detail=get_text("target_not_found", request))
+    _assert_can_manage_target(current_user, t.rep_id, db, request)
     if payload.period_start: t.period_start = payload.period_start
     if payload.period_end: t.period_end = payload.period_end
     if payload.target_qty is not None: t.target_qty = payload.target_qty
@@ -225,31 +230,31 @@ def update_target(
 
 
 @router.delete("/targets/{target_id}")
-def delete_target(target_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set)):
+def delete_target(target_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set), request: Request = None):
     t = db.query(models.Target).filter(models.Target.id == target_id).first()
     if not t:
-        raise HTTPException(status_code=404, detail="Target not found")
-    _assert_can_manage_target(current_user, t.rep_id, db)
+        raise HTTPException(status_code=404, detail=get_text("target_not_found", request))
+    _assert_can_manage_target(current_user, t.rep_id, db, request)
     db.delete(t)
     db.commit()
-    return {"message": "Target deleted"}
+    return {"message": get_text("success_delete", request)}
 
 
 @router.post("/targets/{target_id}/view")
-def view_target(target_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set)):
+def view_target(target_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set), request: Request = None):
     t = db.query(models.Target).filter(models.Target.id == target_id).first()
     if not t:
-        raise HTTPException(status_code=404, detail="Target not found")
+        raise HTTPException(status_code=404, detail=get_text("target_not_found", request))
     if not db.query(models.TargetView).filter(models.TargetView.target_id == target_id, models.TargetView.rep_id == current_user.id).first():
         db.add(models.TargetView(target_id=target_id, rep_id=current_user.id))
         db.commit()
-    return {"message": "Target viewed"}
+    return {"message": get_text("success_update", request)}
 
 
 @router.get("/targets/{target_id}/views", response_model=List[schemas.TargetViewResponse])
-def get_target_views(target_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set)):
+def get_target_views(target_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set), request: Request = None):
     if not db.query(models.Target).filter(models.Target.id == target_id).first():
-        raise HTTPException(status_code=404, detail="Target not found")
+        raise HTTPException(status_code=404, detail=get_text("target_not_found", request))
     results = []
     for v in db.query(models.TargetView).filter(models.TargetView.target_id == target_id).all():
         rep = db.query(models.User).filter(models.User.id == v.rep_id).first()
@@ -258,7 +263,7 @@ def get_target_views(target_id: str, db: Session = Depends(get_db), current_user
 
 
 # ── Clients ──────────────────────────────────────────────────
-def _assert_can_touch_client(current_user: models.User, client: models.Client, db: Session):
+def _assert_can_touch_client(current_user: models.User, client: models.Client, db: Session, request: Request):
     """Reps: own clients only. Supervisors: own + their reps' clients.
     Admin/GM: unrestricted."""
     if current_user.role in ("admin", "general_manager"):
@@ -269,7 +274,7 @@ def _assert_can_touch_client(current_user: models.User, client: models.Client, d
         rep = db.query(models.User).filter(models.User.id == client.rep_id).first()
         if rep and rep.supervisor_id == current_user.id:
             return
-    raise HTTPException(status_code=403, detail="Not authorized")
+    raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
 
 
 @router.get("/clients", response_model=List[schemas.ClientResponse])
@@ -302,28 +307,29 @@ def create_client(
     payload: schemas.ClientCreate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if current_user.role not in ("admin", "rep", "supervisor"):
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     if current_user.role == "rep" and payload.rep_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Cannot create client for another rep")
+        raise HTTPException(status_code=403, detail=get_text("cannot_create_client_other_rep", request))
     if current_user.role == "supervisor":
         # Supervisor can only create clients for themselves or their reps
         if payload.rep_id != current_user.id:
             rep = db.query(models.User).filter(models.User.id == payload.rep_id).first()
             if not rep or rep.supervisor_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Cannot create client for a rep not under your supervision")
+                raise HTTPException(status_code=403, detail=get_text("cannot_create_client_outside_supervision", request))
     
     existing = db.query(models.Client).filter(models.Client.id == payload.id).first()
     if existing:
         return existing
-    new_client = models.Client(**payload.dict())
+    new_client = models.Client(**payload.model_dump())
     db.add(new_client)
     db.commit()
     db.refresh(new_client)
     
     target_name = new_client.doctor_name if new_client.client_type == 'doctor' else new_client.facility_name
-    create_activity_log(db, current_user.id, current_user.full_name, f"Added a new {new_client.client_type}: {target_name}", "user", new_client.id)
+    create_activity_log(db, current_user.id, current_user.full_name, "log_added_client", request=request, type=new_client.client_type, name=target_name)
     
     return new_client
 
@@ -334,11 +340,12 @@ def update_client(
     payload: schemas.ClientCreate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     client = db.query(models.Client).filter(models.Client.id == client_id).first()
     if not client:
-        raise HTTPException(status_code=404, detail="Client not found")
-    _assert_can_touch_client(current_user, client, db)
+        raise HTTPException(status_code=404, detail=get_text("client_not_found", request))
+    _assert_can_touch_client(current_user, client, db, request)
     for key, value in payload.dict(exclude_unset=True).items():
         setattr(client, key, value)
     client.updated_at = datetime.datetime.now(datetime.timezone.utc)
@@ -352,14 +359,15 @@ def delete_client(
     client_id: str,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     client = db.query(models.Client).filter(models.Client.id == client_id).first()
     if not client:
-        raise HTTPException(status_code=404, detail="Client not found")
-    _assert_can_touch_client(current_user, client, db)
+        raise HTTPException(status_code=404, detail=get_text("client_not_found", request))
+    _assert_can_touch_client(current_user, client, db, request)
     db.delete(client)
     db.commit()
-    return {"message": "Client deleted"}
+    return {"message": get_text("success_delete", request)}
 
 
 # ── Brands ───────────────────────────────────────────────────
@@ -369,18 +377,18 @@ def get_brands(db: Session = Depends(get_db), current_user: models.User = Depend
 
 
 @router.get("/brands/{brand_id}", response_model=schemas.BrandResponse)
-def get_brand(brand_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set)):
+def get_brand(brand_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set), request: Request = None):
     b = db.query(models.Brand).filter(models.Brand.id == brand_id).first()
     if not b:
-        raise HTTPException(status_code=404, detail="Brand not found")
+        raise HTTPException(status_code=404, detail=get_text("brand_not_found", request))
     return b
 
 @router.post("/brands", response_model=schemas.BrandResponse)
-def create_brand(payload: schemas.BrandCreate, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set)):
+def create_brand(payload: schemas.BrandCreate, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set), request: Request = None):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     if db.query(models.Brand).filter(models.Brand.name == payload.name).first():
-        raise HTTPException(status_code=400, detail="Brand name already exists")
+        raise HTTPException(status_code=400, detail=get_text("brand_exists", request))
     b = models.Brand(name=payload.name, logo_url=payload.logo_url)
     db.add(b)
     db.commit()
@@ -389,12 +397,12 @@ def create_brand(payload: schemas.BrandCreate, db: Session = Depends(get_db), cu
 
 
 @router.put("/brands/{brand_id}", response_model=schemas.BrandResponse)
-def update_brand(brand_id: str, payload: schemas.BrandUpdate, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set)):
+def update_brand(brand_id: str, payload: schemas.BrandUpdate, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set), request: Request = None):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     b = db.query(models.Brand).filter(models.Brand.id == brand_id).first()
     if not b:
-        raise HTTPException(status_code=404, detail="Brand not found")
+        raise HTTPException(status_code=404, detail=get_text("brand_not_found", request))
     if payload.name is not None: b.name = payload.name
     if payload.logo_url is not None: b.logo_url = payload.logo_url
     if payload.is_active is not None: b.is_active = payload.is_active
@@ -404,12 +412,12 @@ def update_brand(brand_id: str, payload: schemas.BrandUpdate, db: Session = Depe
 
 
 @router.patch("/brands/{brand_id}/toggle", response_model=schemas.BrandResponse)
-def toggle_brand(brand_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set)):
+def toggle_brand(brand_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set), request: Request = None):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     b = db.query(models.Brand).filter(models.Brand.id == brand_id).first()
     if not b:
-        raise HTTPException(status_code=404, detail="Brand not found")
+        raise HTTPException(status_code=404, detail=get_text("brand_not_found", request))
     b.is_active = not b.is_active
     db.commit()
     db.refresh(b)
@@ -418,15 +426,15 @@ def toggle_brand(brand_id: str, db: Session = Depends(get_db), current_user: mod
 
 # ── Field Reports ─────────────────────────────────────────────
 @router.post("/field-reports", response_model=schemas.FieldReportResponse)
-def create_field_report(report: schemas.FieldReportCreate, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set)):
+def create_field_report(report: schemas.FieldReportCreate, db: Session = Depends(get_db), current_user: models.User = Depends(auth.require_password_set), request: Request = None):
     # SECURITY: rep_id is taken from the authenticated user, never from the
     # payload (was spoofable — anyone could file reports as someone else).
     if report.rep_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Cannot file a field report for another user")
+        raise HTTPException(status_code=403, detail=get_text("cannot_file_report_other_user", request))
     db_report = db.query(models.FieldReport).filter(models.FieldReport.id == report.id).first()
     if db_report:
         if db_report.rep_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Not authorized")
+            raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
         db_report.content = report.content
         db_report.photo_url = report.photo_url
     else:
@@ -435,7 +443,7 @@ def create_field_report(report: schemas.FieldReportCreate, db: Session = Depends
     db.commit()
     db.refresh(db_report)
     
-    create_activity_log(db, current_user.id, current_user.full_name, f"Submitted a field report: {db_report.content[:30]}...", "alert", db_report.id)
+    create_activity_log(db, current_user.id, current_user.full_name, "log_submitted_report", request=request, content=db_report.content[:30])
     
     return db_report
 
@@ -447,13 +455,23 @@ def get_field_reports(
     offset: int = 0,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     query = db.query(models.FieldReport)
-    rep_ids = get_role_scoped_rep_ids(current_user, db)
-    if rep_ids is not None:
-        query = query.filter(models.FieldReport.rep_id.in_(rep_ids))
+
+    # 1. Priority: If a specific rep_id is requested, filter by it (after checking authorization)
     if rep_id:
+        if current_user.role not in ("admin", "general_manager"):
+            rep_ids = get_role_scoped_rep_ids(current_user, db)
+            if rep_ids is None or rep_id not in rep_ids:
+                raise HTTPException(status_code=403, detail=get_text("not_authorized_reports", request))
         query = query.filter(models.FieldReport.rep_id == rep_id)
+    # 2. Role Scoping: If no specific rep_id, filter based on user role
+    else:
+        rep_ids = get_role_scoped_rep_ids(current_user, db)
+        if rep_ids is not None:
+            query = query.filter(models.FieldReport.rep_id.in_(rep_ids))
+
     return query.offset(offset).limit(limit).all()
 
 
@@ -463,17 +481,18 @@ async def upload_field_report_photo(
     file: UploadFile,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     report = db.query(models.FieldReport).filter(models.FieldReport.id == report_id).first()
     if not report:
-        raise HTTPException(status_code=404, detail="Field report not found")
+        raise HTTPException(status_code=404, detail=get_text("field_report_not_found", request))
     if report.rep_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid file type")
+        raise HTTPException(status_code=400, detail=get_text("invalid_file_type", request))
     contents = await file.read()
     if len(contents) > MAX_SIZE:
-        raise HTTPException(status_code=400, detail="File too large")
+        raise HTTPException(status_code=400, detail=get_text("file_too_large", request))
     result = await store_file_locally(contents, file.content_type, "visits", None, db)
     report.photo_url = result["local_path"]
     report.photo_file_id = result["stored_file"].id
@@ -490,9 +509,10 @@ def get_logs(
     limit: int = 100,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if current_user.role not in ("admin", "general_manager"):
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     query = db.query(models.ActivityLog)
     if brand_id:
         query = query.join(models.User, models.ActivityLog.user_id == models.User.id).filter(models.User.brand_id == brand_id)
@@ -506,8 +526,9 @@ def get_audit_logs(
     offset: int = 0,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
+        raise HTTPException(status_code=403, detail=get_text("admin_only", request))
     
     return db.query(models.ActivityLog).order_by(models.ActivityLog.created_at.desc()).offset(offset).limit(limit).all()

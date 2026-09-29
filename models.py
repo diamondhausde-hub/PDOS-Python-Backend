@@ -39,6 +39,7 @@ class Brand(Base):
     users = relationship("User", foreign_keys="[User.brand_id]", back_populates="brand")
     centers = relationship("Center", back_populates="brand")
     products = relationship("Product", back_populates="brand")
+    assigned_users = relationship("User", secondary="user_brands", back_populates="brands", overlaps="user,user_brands")
 
 class UserBrand(Base):
     __tablename__ = "user_brands"
@@ -81,7 +82,7 @@ class User(Base):
 
     created_centers = relationship("Center", back_populates="creator", foreign_keys="[Center.created_by]")
     brand = relationship("Brand", foreign_keys=[brand_id], back_populates="users")
-    brands = relationship("Brand", secondary="user_brands", backref="assigned_users")
+    brands = relationship("Brand", secondary="user_brands", back_populates="assigned_users", overlaps="user,user_brands")
 
     # Self-referential relationship for supervisor
     reps = relationship("User", foreign_keys=[supervisor_id])
@@ -439,6 +440,7 @@ class Task(Base):
     target_id = Column(String, nullable=True)
     target_name = Column(String, nullable=True)
     product_id = Column(String, ForeignKey("products.id"), nullable=True)
+    product_name = Column(String, nullable=True)
     quantity_target = Column(Integer, nullable=True)
     due_date = Column(DateTime, nullable=True)
     status = Column(String(20), default='pending')
@@ -455,6 +457,8 @@ class Task(Base):
     reminder_offset = Column(String(10), nullable=True)
     accepted_at = Column(DateTime, nullable=True)
     visit_id = Column(String, ForeignKey("visits.id"), nullable=True)
+    visit_started_at = Column(DateTime, nullable=True)
+    visit_completed_at = Column(DateTime, nullable=True)
 
     rep = relationship("User", foreign_keys=[rep_id])
     brand = relationship("Brand", foreign_keys=[brand_id])
@@ -470,6 +474,7 @@ class BrandActivityLog(Base):
     activity_type = Column(String(30), nullable=True)
     target_type = Column(String(20), nullable=True)
     target_id = Column(String, nullable=True)
+    target_name = Column(String, nullable=True)
     logged_at = Column(DateTime, default=datetime.datetime.utcnow)
     notes = Column(Text, nullable=True)
     status = Column(String(20), default='completed')

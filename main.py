@@ -12,12 +12,14 @@ import logging
 import mimetypes
 import os
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.orm import Session
+from routers.deps import get_text
+from contextlib import asynccontextmanager
 
 import models
 import auth
@@ -45,7 +47,25 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── App ───────────────────────────────────────────────────────
-app = FastAPI(title="PDOS Python Backend")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    _init_firebase()
+    pubsub = await redis_manager.subscribe(NOTIFICATION_CHANNEL, None)
+    redis_task = None
+    if pubsub:
+        redis_task = asyncio.create_task(_listen_redis(pubsub))
+    for d in UPLOAD_DIRS.values():
+        os.makedirs(d, exist_ok=True)
+
+    yield
+
+    # Shutdown
+    if redis_task:
+        redis_task.cancel()
+    await redis_manager.close()
+
+app = FastAPI(title="PDOS Python Backend", lifespan=lifespan)
 
 # Rate limiter — single shared instance from routers.deps
 app.state.limiter = limiter
@@ -76,7 +96,7 @@ async def log_errors(request, call_next):
         return await call_next(request)
     except Exception:
         logger.exception("Unhandled error on %s %s", request.method, request.url.path)
-        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        return JSONResponse(status_code=500, content={"detail": get_text("internal_server_error", request)})
 
 # Create DB tables
 models.Base.metadata.create_all(bind=engine)
@@ -92,7 +112,17 @@ app.include_router(misc_router)
 app.include_router(analytics.router)
 app.include_router(reports.router)
 app.include_router(chat_router)
+from fastapi.staticfiles import StaticFiles
+
+# ... other imports ...
+# I will place this after the router includes
 app.include_router(tasks_router)
+
+# Serve uploads directory as static files
+# This allows accessing images via http://host:port/uploads/...
+if not os.path.exists("uploads"):
+    os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 
 # ── Lifecycle ─────────────────────────────────────────────────
@@ -102,16 +132,6 @@ UPLOAD_DIRS = {
     "receipts": "uploads/receipts",
     "visits": "uploads/visits",
 }
-
-
-@app.on_event("startup")
-async def startup():
-    _init_firebase()
-    pubsub = await redis_manager.subscribe(NOTIFICATION_CHANNEL, None)
-    if pubsub:
-        asyncio.ensure_future(_listen_redis(pubsub))
-    for d in UPLOAD_DIRS.values():
-        os.makedirs(d, exist_ok=True)
 
 
 def _init_firebase():
@@ -147,9 +167,10 @@ def _init_firebase():
         logger.exception("Failed to initialize Firebase Admin SDK - push notifications disabled")
 
 
-@app.on_event("shutdown")
-async def shutdown():
-    await redis_manager.close()
+# ── Root Endpoint ──────────────────────────────────────────────
+@app.get("/")
+def read_root():
+    return {"message": "PDOS Python Backend is running"}
 
 
 
@@ -171,58 +192,8 @@ async def _listen_redis(pubsub):
         pass
 
 
-# ── File serving ──────────────────────────────────────────────
-from fastapi.responses import FileResponse
-import os
-
-@app.get("/uploads/products/{path:path}")
-async def serve_upload_product(
-    path: str,
-    db: Session = Depends(get_db),
-):
-    from fastapi import HTTPException
-    local_path = f"/uploads/products/{path}"
-    sf = db.query(models.StoredFile).filter(models.StoredFile.local_path == local_path).first()
-    if not sf:
-        real_local_path = local_path.lstrip("/")
-        if os.path.exists(real_local_path):
-            return FileResponse(real_local_path)
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    return await _proxy_stored_file(sf, local_path)
-
-@app.get("/uploads/{path:path}")
-async def serve_upload(
-    path: str,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
-):
-    from fastapi import HTTPException
-    local_path = f"/uploads/{path}"
-    
-    sf = db.query(models.StoredFile).filter(models.StoredFile.local_path == local_path).first()
-    if not sf:
-        real_local_path = local_path.lstrip("/")
-        if os.path.exists(real_local_path):
-            return FileResponse(real_local_path)
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return await _proxy_stored_file(sf, local_path)
-
-async def _proxy_stored_file(sf, local_path):
-    from fastapi import HTTPException
-    import mimetypes
-
-    full_path = os.path.normpath(local_path.lstrip("/"))
-    if not os.path.abspath(full_path).startswith(os.path.abspath("uploads")):
-        raise HTTPException(status_code=400, detail="Invalid path")
-    if os.path.exists(full_path):
-        mime, _ = mimetypes.guess_type(sf.original_name)
-        return FileResponse(full_path, media_type=mime)
-
-    raise HTTPException(status_code=404, detail="File unavailable")
-
-
+# ── Root Endpoint ──────────────────────────────────────────────
 @app.get("/")
 def read_root():
     return {"message": "PDOS Python Backend is running"}
+

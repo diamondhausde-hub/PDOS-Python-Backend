@@ -24,9 +24,34 @@ from routers.deps import (
 router = APIRouter()
 
 
-# ── Internal helpers ─────────────────────────────────────────
-def _assert_can_manage_appointment(current_user: models.User, appt_rep_id: str, db: Session):
-    if current_user.role == "admin":
+def notify_doctor_visit_completed(db: Session, visit: models.Visit, current_user: models.User):
+    """Helper to notify supervisor and GMs when a doctor visit is completed."""
+    print(f"DEBUG: Entering notify_doctor_visit_completed for visit {visit.id}")
+    client = db.query(models.Client).filter(models.Client.id == visit.client_id).first() if visit.client_id else None
+    doctor_label = f"Dr. {client.doctor_name}" if client and client.doctor_name else "a doctor"
+    tier = f" — Class {client.class_tier}" if client and client.class_tier else ""
+    msg = f"{current_user.full_name} completed a doctor visit with {doctor_label}{tier}."
+
+    # Ensure we have the latest supervisor link from DB
+    user_record = db.query(models.User).filter(models.User.id == current_user.id).first()
+    sup_id = user_record.supervisor_id if user_record else None
+    print(f"DEBUG: User {current_user.id} has supervisor {sup_id}")
+
+    recipients = {sup_id} if sup_id else set()
+    for gm in db.query(models.User).filter(models.User.role == "general_manager", models.User.is_active == True).all():
+        recipients.add(gm.id)
+
+    print(f"DEBUG: Notification recipients: {recipients}")
+
+    for rid in recipients:
+        if rid:
+            print(f"DEBUG: Dispatching notification to {rid}")
+            dispatch_notification_sync(db=db, user_id=rid, type="doctor_visit_completed",
+                                       title="Doctor Visit Completed",
+                                       message=msg, related_id=visit.id)
+
+def _assert_can_manage_appointment(current_user: models.User, appt_rep_id: str, db: Session, request: Request):
+    if current_user.role in ("admin", "general_manager"):
         return
     if current_user.role == "supervisor":
         rep = db.query(models.User).filter(models.User.id == appt_rep_id).first()
@@ -34,11 +59,11 @@ def _assert_can_manage_appointment(current_user: models.User, appt_rep_id: str, 
             return
     if current_user.role == "rep" and current_user.id == appt_rep_id:
         return
-    raise HTTPException(status_code=403, detail="Not authorized")
+    raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
 
 
-def _assert_can_manage_visit(current_user: models.User, visit_rep_id: str, db: Session):
-    if current_user.role == "admin":
+def _assert_can_manage_visit(current_user: models.User, visit_rep_id: str, db: Session, request: Request):
+    if current_user.role in ("admin", "general_manager"):
         return
     if current_user.role == "rep" and current_user.id == visit_rep_id:
         return
@@ -46,33 +71,48 @@ def _assert_can_manage_visit(current_user: models.User, visit_rep_id: str, db: S
         rep = db.query(models.User).filter(models.User.id == visit_rep_id).first()
         if rep and rep.supervisor_id == current_user.id:
             return
-    raise HTTPException(status_code=403, detail="Not authorized for this rep")
+    raise HTTPException(status_code=403, detail=get_text("not_authorized_rep", request))
 
 
 # ── Appointments ─────────────────────────────────────────────
 @router.get("/appointments", response_model=List[schemas.AppointmentResponse])
 def get_appointments(current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db)):
     rep_ids = get_role_scoped_rep_ids(current_user, db)
-    query = db.query(models.Appointment)
+
+    # Optimize N+1 by joining required tables
+    appointments = db.query(
+        models.Appointment,
+        models.Center.name.label("center_name"),
+        models.Client.doctor_name,
+        models.Client.facility_name,
+        models.Product.name.label("product_name")
+    ).join(
+        models.Center, models.Appointment.center_id == models.Center.id
+    ).outerjoin(
+        models.Client, models.Appointment.client_id == models.Client.id
+    ).outerjoin(
+        models.Product, models.Appointment.suggested_product_id == models.Product.id
+    )
+
     if rep_ids is not None:
-        query = query.filter(models.Appointment.rep_id.in_(rep_ids))
-    results = []
-    for a in query.all():
-        center = db.query(models.Center).filter(models.Center.id == a.center_id).first()
-        client = db.query(models.Client).filter(models.Client.id == a.client_id).first() if a.client_id else None
-        product = db.query(models.Product).filter(models.Product.id == a.suggested_product_id).first() if a.suggested_product_id else None
-        results.append({
-            **a.__dict__,
-            "center_name": center.name if center else None,
-            "client_name": f"{client.doctor_name or client.facility_name or ''}" if client else None,
-            "suggested_product_name": product.name if product else None,
-        })
-    return results
+        appointments = appointments.filter(models.Appointment.rep_id.in_(rep_ids))
+
+    final_results = []
+    for a, center_name, doc_name, fac_name, prod_name in appointments.all():
+        data = a.__dict__.copy()
+        data.pop('_sa_instance_state', None)
+
+        data["center_name"] = center_name
+        data["client_name"] = doc_name or fac_name or ""
+        data["suggested_product_name"] = prod_name
+        final_results.append(data)
+
+    return final_results
 
 
 @router.post("/appointments", response_model=schemas.AppointmentResponse)
-def create_appointment(payload: schemas.AppointmentCreate, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db)):
-    _assert_can_manage_appointment(current_user, payload.rep_id, db)
+def create_appointment(payload: schemas.AppointmentCreate, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db), request: Request = None):
+    _assert_can_manage_appointment(current_user, payload.rep_id, db, request)
     
     # Idempotency check
     existing = db.query(models.Appointment).filter(models.Appointment.id == payload.id).first()
@@ -83,8 +123,12 @@ def create_appointment(payload: schemas.AppointmentCreate, current_user: models.
             db.refresh(existing)
         center = db.query(models.Center).filter(models.Center.id == existing.center_id).first()
         client = db.query(models.Client).filter(models.Client.id == existing.client_id).first() if existing.client_id else None
-        return {**existing.__dict__, "center_name": center.name if center else None,
-                "client_name": f"{client.doctor_name or client.facility_name or ''}" if client else None}
+
+        # Proper serialization
+        data = schemas.AppointmentResponse.model_validate(existing).model_dump()
+        data["center_name"] = center.name if center else None
+        data["client_name"] = f"{client.doctor_name or client.facility_name or ''}" if client else None
+        return data
 
     ref_code = generate_next_reference_code(db, "APT")
     a = models.Appointment(
@@ -102,20 +146,22 @@ def create_appointment(payload: schemas.AppointmentCreate, current_user: models.
     center = db.query(models.Center).filter(models.Center.id == a.center_id).first()
     client = db.query(models.Client).filter(models.Client.id == a.client_id).first() if a.client_id else None
     target_name = client.doctor_name if (client and client.doctor_name) else (client.facility_name if client else (center.name if center else "Unknown"))
-    
-    create_activity_log(db, current_user.id, current_user.full_name, f"Scheduled an appointment with {target_name} on {a.appt_date}", "visit", a.id)
-    center = db.query(models.Center).filter(models.Center.id == a.center_id).first()
-    client = db.query(models.Client).filter(models.Client.id == a.client_id).first() if a.client_id else None
-    return {**a.__dict__, "center_name": center.name if center else None,
-            "client_name": f"{client.doctor_name or client.facility_name or ''}" if client else None}
+
+    create_activity_log(db, current_user.id, current_user.full_name, "log_scheduled_appt", request=request, name=target_name, date=a.appt_date)
+
+    # Proper serialization
+    data = schemas.AppointmentResponse.model_validate(a).model_dump()
+    data["center_name"] = center.name if center else None
+    data["client_name"] = f"{client.doctor_name or client.facility_name or ''}" if client else None
+    return data
 
 
 @router.put("/appointments/{id}", response_model=schemas.AppointmentResponse)
-def update_appointment(id: str, payload: schemas.AppointmentUpdate, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db)):
+def update_appointment(id: str, payload: schemas.AppointmentUpdate, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db), request: Request = None):
     a = db.query(models.Appointment).filter(models.Appointment.id == id).first()
     if not a:
-        raise HTTPException(status_code=404, detail="Appointment not found")
-    _assert_can_manage_appointment(current_user, a.rep_id, db)
+        raise HTTPException(status_code=404, detail=get_text("appointment_not_found", request))
+    _assert_can_manage_appointment(current_user, a.rep_id, db, request)
     if payload.client_id is not None: a.client_id = payload.client_id
     if payload.appt_date: a.appt_date = payload.appt_date
     if payload.appt_time: a.appt_time = payload.appt_time
@@ -127,19 +173,23 @@ def update_appointment(id: str, payload: schemas.AppointmentUpdate, current_user
     db.refresh(a)
     center = db.query(models.Center).filter(models.Center.id == a.center_id).first()
     client = db.query(models.Client).filter(models.Client.id == a.client_id).first() if a.client_id else None
-    return {**a.__dict__, "center_name": center.name if center else None,
-            "client_name": f"{client.doctor_name or client.facility_name or ''}" if client else None}
+
+    # Proper serialization
+    data = schemas.AppointmentResponse.model_validate(a).model_dump()
+    data["center_name"] = center.name if center else None
+    data["client_name"] = f"{client.doctor_name or client.facility_name or ''}" if client else None
+    return data
 
 
 @router.delete("/appointments/{id}")
-def delete_appointment(id: str, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db)):
+def delete_appointment(id: str, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db), request: Request = None):
     a = db.query(models.Appointment).filter(models.Appointment.id == id).first()
     if not a:
-        raise HTTPException(status_code=404, detail="Appointment not found")
-    _assert_can_manage_appointment(current_user, a.rep_id, db)
+        raise HTTPException(status_code=404, detail=get_text("appointment_not_found", request))
+    _assert_can_manage_appointment(current_user, a.rep_id, db, request)
     db.delete(a)
     db.commit()
-    return {"message": "Appointment deleted"}
+    return {"message": get_text("success_delete", request)}
 
 
 # ── Check-in ─────────────────────────────────────────────────
@@ -148,9 +198,10 @@ async def check_in(
     payload: schemas.CheckInRequest,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if not payload.center_id and not payload.client_id:
-        raise HTTPException(status_code=400, detail="Must provide either center_id or client_id")
+        raise HTTPException(status_code=400, detail=get_text("required_field", request))
 
     visit_status = "arrived"
     center = None
@@ -159,14 +210,14 @@ async def check_in(
     if center_id:
         center = db.query(models.Center).filter(models.Center.id == center_id).first()
         if not center:
-            raise HTTPException(status_code=404, detail="Center not found")
+            raise HTTPException(status_code=404, detail=get_text("center_not_found", request))
         if center.latitude and center.longitude and payload.latitude and payload.longitude:
             if haversine_distance(payload.latitude, payload.longitude, center.latitude, center.longitude) > get_setting(db, "geofence_radius_meters", 500.0):
                 visit_status = "flagged"
     elif payload.client_id:
         client = db.query(models.Client).filter(models.Client.id == payload.client_id).first()
         if not client:
-            raise HTTPException(status_code=404, detail="Client not found")
+            raise HTTPException(status_code=404, detail=get_text("client_not_found", request))
         if client.latitude and client.longitude and payload.latitude and payload.longitude:
             if haversine_distance(payload.latitude, payload.longitude, client.latitude, client.longitude) > get_setting(db, "geofence_radius_meters", 500.0):
                 visit_status = "flagged"
@@ -202,7 +253,7 @@ async def check_in(
     db.refresh(new_visit)
     enrich_visits([new_visit], db)
     target_name = client.doctor_name if (client and client.doctor_name) else (client.facility_name if client else (center.name if center else "Unknown target"))
-    create_activity_log(db, current_user.id, current_user.full_name, f"Checked in at {target_name}", "visit", new_visit.id)
+    create_activity_log(db, current_user.id, current_user.full_name, "log_checked_in", request=request, name=target_name)
     await manager.broadcast("refresh_analytics")
     return new_visit
 
@@ -269,7 +320,7 @@ async def create_visit(
         if task:
             task.visit_id = new_visit.id
             task.status = 'done'
-            task.completed_at = datetime.datetime.utcnow()
+            task.completed_at = datetime.datetime.now(datetime.timezone.utc)
             
     db.commit()
     db.refresh(new_visit)
@@ -296,19 +347,7 @@ async def create_visit(
                                    related_id=new_visit.id)
     # Doctor-visit flow: inform the supervisor AND every general manager
     if (new_visit.visit_type == "doctor" and new_visit.status == "completed"):
-        client = db.query(models.Client).filter(models.Client.id == new_visit.client_id).first() if new_visit.client_id else None
-        doctor_label = f"Dr. {client.doctor_name}" if client and client.doctor_name else "a doctor"
-        tier = f" — Class {client.class_tier}" if client and client.class_tier else ""
-        msg = f"{current_user.full_name} completed a doctor visit with {doctor_label}{tier}."
-        recipients = {current_user.supervisor_id} if current_user.supervisor_id else set()
-        for gm in db.query(models.User).filter(models.User.role == "general_manager", models.User.is_active == True).all():
-            recipients.add(gm.id)
-        for rid in recipients:
-            if not rid:
-                continue
-            dispatch_notification_sync(db=db, user_id=rid, type="doctor_visit_completed",
-                                       title="Doctor Visit Completed",
-                                       message=msg, related_id=new_visit.id)
+        notify_doctor_visit_completed(db, new_visit, current_user)
     center = db.query(models.Center).filter(models.Center.id == new_visit.center_id).first() if new_visit.center_id else None
     client = db.query(models.Client).filter(models.Client.id == new_visit.client_id).first() if new_visit.client_id else None
     target_name = client.doctor_name if (client and client.doctor_name) else (client.facility_name if client else (center.name if center else "Unknown target"))
@@ -324,7 +363,20 @@ async def create_visit(
             action_text += f" Sold {items_sold} items, gave {gifts_given} gifts."
             
     create_activity_log(db, current_user.id, current_user.full_name, action_text, "visit", new_visit.id)
-
+    
+    b_id = new_visit.brand_id or (center.brand_id if center and hasattr(center, 'brand_id') else None) or (client.brand_id if client and hasattr(client, 'brand_id') else None) or (current_user.brand_ids[0] if current_user.brand_ids else None)
+    if b_id:
+        db.add(models.BrandActivityLog(
+            rep_id=current_user.id,
+            brand_id=b_id,
+            activity_type='visit',
+            target_type=new_visit.visit_type or 'center',
+            target_id=new_visit.client_id if new_visit.client_id else new_visit.center_id,
+            target_name=target_name,
+            notes=visit.notes,
+            status=new_visit.status
+        ))
+        db.commit()
     await manager.broadcast("refresh_analytics")
     return new_visit
 
@@ -344,11 +396,11 @@ def get_visits(status: Optional[str] = None, brand_id: Optional[str] = None, cur
 
 
 @router.get("/visits/{visit_id}", response_model=schemas.VisitResponse)
-def get_visit(visit_id: str, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db)):
+def get_visit(visit_id: str, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db), request: Request = None):
     visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
     if not visit:
-        raise HTTPException(status_code=404, detail="Visit not found")
-    _assert_can_manage_visit(current_user, visit.rep_id, db)
+        raise HTTPException(status_code=404, detail=get_text("visit_not_found", request))
+    _assert_can_manage_visit(current_user, visit.rep_id, db, request)
     return enrich_visits([visit], db)[0]
 
 @router.put("/visits/{visit_id}/review", response_model=schemas.VisitResponse)
@@ -357,20 +409,24 @@ def review_visit(
     payload: schemas.VisitReviewRequest,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
     if not visit:
-        raise HTTPException(status_code=404, detail="Visit not found")
+        raise HTTPException(status_code=404, detail=get_text("visit_not_found", request))
     if current_user.role == "supervisor":
         rep = db.query(models.User).filter(models.User.id == visit.rep_id).first()
         if not rep or rep.supervisor_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Not authorized for this rep")
+            raise HTTPException(status_code=403, detail=get_text("not_authorized_rep", request))
     elif current_user.role not in ("admin", "general_manager", "overseer"):
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     if visit.status != "flagged":
-        raise HTTPException(status_code=409, detail="Visit is no longer pending review")
+        raise HTTPException(status_code=409, detail=get_text("visit_no_longer_pending", request))
     if payload.status == "completed":
         visit.status = "completed"
+        # Trigger doctor visit completion notification if applicable
+        if visit.visit_type == "doctor":
+            notify_doctor_visit_completed(db, visit, current_user)
     elif payload.status == "rejected":
         visit.status = "rejected"
         for item in visit.items:
@@ -382,7 +438,7 @@ def review_visit(
             if appt:
                 appt.status = "pending"
     else:
-        raise HTTPException(status_code=400, detail="Invalid status")
+        raise HTTPException(status_code=400, detail=get_text("invalid_status", request))
     visit.reviewed_by = current_user.id
     visit.reviewed_at = datetime.datetime.now(datetime.timezone.utc)
     visit.review_note = payload.note
@@ -402,11 +458,12 @@ def add_visit_note(
     payload: schemas.ReviewNoteCreate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
     if not visit:
-        raise HTTPException(status_code=404, detail="Visit not found")
-    _assert_can_manage_visit(current_user, visit.rep_id, db)
+        raise HTTPException(status_code=404, detail=get_text("visit_not_found", request))
+    _assert_can_manage_visit(current_user, visit.rep_id, db, request)
     visit.supervisor_note = payload.review_note
     db.commit()
     db.refresh(visit)
@@ -417,15 +474,15 @@ def add_visit_note(
 
 
 @router.get("/visits/{visit_id}/invoice")
-def get_visit_invoice(visit_id: str, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db)):
+def get_visit_invoice(visit_id: str, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db), request: Request = None):
     from fpdf import FPDF
     import tempfile, os as _os
     from starlette.background import BackgroundTask
 
     visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
     if not visit:
-        raise HTTPException(status_code=404, detail="Visit not found")
-    _assert_can_manage_visit(current_user, visit.rep_id, db)
+        raise HTTPException(status_code=404, detail=get_text("visit_not_found", request))
+    _assert_can_manage_visit(current_user, visit.rep_id, db, request)
 
     pdf = FPDF()
     pdf.add_page()
@@ -459,17 +516,18 @@ async def upload_visit_signature(
     visit_id: str, file: UploadFile,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
     if not visit:
-        raise HTTPException(status_code=404, detail="Visit not found")
+        raise HTTPException(status_code=404, detail=get_text("visit_not_found", request))
     if visit.rep_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid file type")
+        raise HTTPException(status_code=400, detail=get_text("invalid_file_type", request))
     contents = await file.read()
     if len(contents) > MAX_SIZE:
-        raise HTTPException(status_code=400, detail="File too large")
+        raise HTTPException(status_code=400, detail=get_text("file_too_large", request))
     result = await store_file_locally(contents, file.content_type, "signatures", None, db)
     visit.signature_url = result["local_path"]
     visit.signature_file_id = result["stored_file"].id
@@ -483,17 +541,18 @@ async def upload_visit_photo(
     visit_id: str, file: UploadFile,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
     if not visit:
-        raise HTTPException(status_code=404, detail="Visit not found")
+        raise HTTPException(status_code=404, detail=get_text("visit_not_found", request))
     if visit.rep_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the rep who owns this visit can upload photos")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid file type")
+        raise HTTPException(status_code=400, detail=get_text("invalid_file_type", request))
     contents = await file.read()
     if len(contents) > MAX_SIZE:
-        raise HTTPException(status_code=400, detail="File too large")
+        raise HTTPException(status_code=400, detail=get_text("file_too_large", request))
     result = await store_file_locally(contents, file.content_type, "visits", None, db)
     vp = models.VisitPhoto(visit_id=visit_id, photo_url=result["local_path"], photo_file_id=result["stored_file"].id)
     db.add(vp)
@@ -503,22 +562,36 @@ async def upload_visit_photo(
 
 
 # ── Stock checks ─────────────────────────────────────────────
+@router.get("/visits/{visit_id}/stock-checks", response_model=List[schemas.StockCheckResponse])
+def get_visit_stock_checks(
+    visit_id: str,
+    current_user: models.User = Depends(auth.require_password_set),
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
+    if not visit:
+        raise HTTPException(status_code=404, detail=get_text("visit_not_found", request))
+    _assert_can_manage_visit(current_user, visit.rep_id, db, request)
+    return db.query(models.PharmacyStockCheck).filter(models.PharmacyStockCheck.visit_id == visit_id).all()
+
 @router.post("/stock-checks", response_model=List[schemas.StockCheckResponse])
 def create_stock_checks(
     payload: List[schemas.StockCheckCreate],
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     results = []
     for item in payload:
         visit = db.query(models.Visit).filter(models.Visit.id == item.visit_id).first()
         if not visit or visit.rep_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Not authorized for this visit")
+            raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
         existing = db.query(models.PharmacyStockCheck).filter_by(visit_id=item.visit_id, product_id=item.product_id).first()
         if existing:
             results.append(existing)
             continue
-        new_check = models.PharmacyStockCheck(**item.dict())
+        new_check = models.PharmacyStockCheck(**item.model_dump())
         db.add(new_check)
         results.append(new_check)
     db.commit()
@@ -533,13 +606,14 @@ def create_expense(
     payload: schemas.ExpenseCreate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if payload.visit_id:
         visit = db.query(models.Visit).filter(models.Visit.id == payload.visit_id).first()
         if not visit:
-            raise HTTPException(status_code=404, detail="Visit not found")
+            raise HTTPException(status_code=404, detail=get_text("visit_not_found", request))
         if current_user.role == "rep" and visit.rep_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Not authorized")
+            raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     existing = db.query(models.Expense).filter(models.Expense.id == payload.id).first()
     threshold = float((db.query(models.SystemSetting).filter(models.SystemSetting.key == "expense_approval_threshold").first() or type("o", (), {"value": "999999"})()).value)
     requires_admin = payload.amount > threshold
@@ -561,7 +635,7 @@ def create_expense(
     db.add(new_expense)
     db.commit()
     db.refresh(new_expense)
-    create_activity_log(db, current_user.id, current_user.full_name, f"Submitted expense ${new_expense.amount:.2f}", "order", new_expense.id)
+    create_activity_log(db, current_user.id, current_user.full_name, "log_submitted_expense", request=request, amount=f"{new_expense.amount:.2f}")
     return new_expense
 
 
@@ -570,9 +644,10 @@ def get_all_expenses(
     status: Optional[str] = None, brand_id: Optional[str] = None,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if current_user.role not in ("admin", "general_manager"):
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     query = db.query(models.Expense)
     if brand_id:
         query = query.join(models.User, models.Expense.rep_id == models.User.id).filter(models.User.brand_id == brand_id)
@@ -602,12 +677,12 @@ def get_team_expenses(
 
 
 @router.get("/visits/{visit_id}/expenses", response_model=List[schemas.ExpenseResponse])
-def get_visit_expenses(visit_id: str, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db)):
+def get_visit_expenses(visit_id: str, current_user: models.User = Depends(auth.require_password_set), db: Session = Depends(get_db), request: Request = None):
     visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
     if not visit:
-        raise HTTPException(status_code=404, detail="Visit not found")
+        raise HTTPException(status_code=404, detail=get_text("visit_not_found", request))
     # SECURITY: role-scoped access (was readable by any authenticated user)
-    _assert_can_manage_visit(current_user, visit.rep_id, db)
+    _assert_can_manage_visit(current_user, visit.rep_id, db, request)
     return db.query(models.Expense).filter(models.Expense.visit_id == visit_id).all()
 
 
@@ -616,17 +691,18 @@ async def upload_expense_receipt(
     expense_id: str, file: UploadFile,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     expense = db.query(models.Expense).filter(models.Expense.id == expense_id).first()
     if not expense:
-        raise HTTPException(status_code=404, detail="Expense not found")
+        raise HTTPException(status_code=404, detail=get_text("expense_not_found", request))
     if expense.rep_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid file type")
+        raise HTTPException(status_code=400, detail=get_text("invalid_file_type", request))
     contents = await file.read()
     if len(contents) > MAX_SIZE:
-        raise HTTPException(status_code=400, detail="File too large")
+        raise HTTPException(status_code=400, detail=get_text("file_too_large", request))
     result = await store_file_locally(contents, file.content_type, "receipts", None, db)
     expense.receipt_image_url = result["local_path"]
     expense.receipt_file_id = result["stored_file"].id
@@ -640,21 +716,21 @@ def update_expense_status(
     expense_id: str, payload: schemas.ExpenseStatusUpdate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
+    if payload.status not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail=get_text("invalid_status", request))
     expense = db.query(models.Expense).filter(models.Expense.id == expense_id).first()
     if not expense:
-        raise HTTPException(status_code=404, detail="Expense not found")
+        raise HTTPException(status_code=404, detail=get_text("expense_not_found", request))
     if expense.rep_id == current_user.id:
-        raise HTTPException(status_code=403, detail="Cannot approve your own expense")
-    if current_user.role == "general_manager":
-        if not expense.requires_gm_approval:
-            raise HTTPException(status_code=403, detail="GM can only manage GM-required expenses")
-    elif current_user.role == "supervisor" and expense.requires_gm_approval:
-        raise HTTPException(status_code=403, detail="This expense requires GM approval")
-    else:
-        _assert_can_manage_visit(current_user, expense.rep_id, db)
+        raise HTTPException(status_code=403, detail=get_text("cannot_approve_own", request))
+    if current_user.role == "supervisor" and expense.requires_gm_approval:
+        raise HTTPException(status_code=403, detail=get_text("requires_gm_approval", request))
+    elif current_user.role not in ("admin", "general_manager"):
+        _assert_can_manage_visit(current_user, expense.rep_id, db, request)
     if expense.status not in ["pending", "escalated"]:
-        raise HTTPException(status_code=409, detail="Already reviewed")
+        raise HTTPException(status_code=409, detail=get_text("already_reviewed", request))
     if payload.status == "approved" and current_user.role not in ("admin", "general_manager"):
         expense.status = "escalated" if expense.requires_admin_approval else "approved"
     else:
@@ -674,6 +750,7 @@ async def abandon_sync_item(
     payload: dict,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     if current_user.supervisor_id:
         import uuid
@@ -681,10 +758,10 @@ async def abandon_sync_item(
             id=str(uuid.uuid4()),
             user_id=current_user.supervisor_id,
             type="sync_abandoned",
-            title="مزامنة متجاهلة",
-            message=f"المندوب {current_user.full_name} قام بتجاهل عنصر من نوع {payload.get('type')}.",
+            title=get_text("sync_abandoned_title", request),
+            message=get_text("sync_abandoned_msg", request).format(rep=current_user.full_name, type=payload.get('type')),
             related_id=payload.get("id"),
             created_at=datetime.datetime.now(datetime.timezone.utc),
         ))
         db.commit()
-    return {"status": "ok"}
+    return {"message": get_text("success_update", request)}

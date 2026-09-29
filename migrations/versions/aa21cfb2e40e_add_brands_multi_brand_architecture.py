@@ -57,7 +57,7 @@ def upgrade() -> None:
     # ─────────────────────────────────────────────────────────────────────────
     # 2. Seed the two initial brands
     # ─────────────────────────────────────────────────────────────────────────
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     bind.execute(sa.text("""
         INSERT INTO brands (id, name, logo_url, is_active, created_at)

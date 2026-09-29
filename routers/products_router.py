@@ -2,6 +2,7 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, Request
 from sqlalchemy.orm import Session
+from routers.deps import get_text
 
 import models, schemas, auth
 from database import get_db
@@ -31,16 +32,17 @@ def create_product(
     product: schemas.ProductCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     if current_user.role == "admin":
-        raise HTTPException(status_code=403, detail="Admin has no business data access")
+        raise HTTPException(status_code=403, detail=get_text("admin_no_business_access", request))
     if current_user.role == "rep":
-        raise HTTPException(status_code=403, detail="Reps cannot create products")
+        raise HTTPException(status_code=403, detail=get_text("rep_cannot_create_product", request))
     if current_user.role == "general_manager":
-        raise HTTPException(status_code=403, detail="Use the supervisor account for this brand to create products")
+        raise HTTPException(status_code=403, detail=get_text("gm_use_supervisor_account", request))
     brand_id = current_user.brand_id
     if not brand_id:
-        raise HTTPException(status_code=422, detail="Supervisor account has no brand assigned")
+        raise HTTPException(status_code=422, detail=get_text("supervisor_no_brand", request))
     new_prod = models.Product(
         name=product.name, category=product.category, price=product.price,
         barcode=product.barcode, min_threshold=product.min_threshold,
@@ -59,14 +61,15 @@ def update_product(
     product: schemas.ProductCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     if current_user.role not in ("general_manager", "supervisor"):
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     db_prod = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not db_prod:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise HTTPException(status_code=404, detail=get_text("product_not_found", request))
     if current_user.role == "supervisor" and db_prod.brand_id != current_user.brand_id:
-        raise HTTPException(status_code=403, detail="Cannot edit products from another brand")
+        raise HTTPException(status_code=403, detail=get_text("cannot_edit_other_brand_product", request))
     db_prod.name = product.name
     db_prod.category = product.category
     db_prod.price = product.price
@@ -84,15 +87,16 @@ def delete_product(
     product_id: str,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can delete products")
+        raise HTTPException(status_code=403, detail=get_text("admin_only_delete_product", request))
     db_prod = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not db_prod:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise HTTPException(status_code=404, detail=get_text("product_not_found", request))
     db_prod.is_active = False
     db.commit()
-    return {"message": "Product deleted"}
+    return {"message": get_text("success_delete", request)}
 
 
 @router.post("/products/{product_id}/image")
@@ -101,17 +105,18 @@ async def upload_product_image(
     file: UploadFile,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set),
+    request: Request = None,
 ):
     if current_user.role not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized", request))
     if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid file type")
+        raise HTTPException(status_code=400, detail=get_text("invalid_file_type", request))
     contents = await file.read()
     if len(contents) > MAX_SIZE:
-        raise HTTPException(status_code=400, detail="File too large")
+        raise HTTPException(status_code=400, detail=get_text("file_too_large", request))
     product = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise HTTPException(status_code=404, detail=get_text("product_not_found", request))
     result = await store_file_locally(contents, file.content_type, "products", product.image_url, db)
     product.image_url = result["local_path"]
     product.image_file_id = result["stored_file"].id
@@ -126,14 +131,15 @@ def report_product(
     payload: schemas.NoteCreate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     product = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise HTTPException(status_code=404, detail=get_text("product_not_found", request))
     if current_user.supervisor_id:
         dispatch_notification_sync(
             db, user_id=current_user.supervisor_id, type="product_report",
-            title=f"تقرير عن المنتج من {current_user.full_name}",
+            title=get_text("product_report_title", request).format(name=current_user.full_name),
             message=f"{product.name}: {payload.content}", related_id=product_id,
         )
     create_activity_log(

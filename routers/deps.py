@@ -11,7 +11,7 @@ from uuid import uuid4
 import hashlib
 import os
 
-from fastapi import WebSocket
+from fastapi import WebSocket, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from slowapi import Limiter
@@ -31,6 +31,38 @@ limiter = Limiter(key_func=get_remote_address)
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_SIZE = 5 * 1024 * 1024  # 5 MB
 NOTIFICATION_CHANNEL = "notifications"
+
+
+# ──────────────────────────────────────────────
+# Translation helper
+# ──────────────────────────────────────────────
+class Translator:
+    def __init__(self):
+        self.locales = {}
+
+    def load_locales(self):
+        for lang in ["en", "ar"]:
+            path = f"locales/{lang}.json"
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    self.locales[lang] = json.load(f)
+
+    def translate(self, key: str, request: Optional[Request] = None) -> str:
+        # Detect language from Accept-Language header
+        accept_lang = "en"
+        if request is not None and hasattr(request, "headers"):
+            accept_lang = request.headers.get("accept-language", "en")
+        lang = "ar" if "ar" in accept_lang.lower() else "en"
+
+        # Fallback to English if requested language not loaded
+        locale = self.locales.get(lang, self.locales.get("en", {}))
+        return locale.get(key, key)
+
+translator = Translator()
+translator.load_locales()
+
+def get_text(key: str, request: Optional[Request] = None) -> str:
+    return translator.translate(key, request)
 
 
 # ──────────────────────────────────────────────
@@ -115,14 +147,25 @@ def enrich_visits(visits, db: Session):
 # Activity log
 # ──────────────────────────────────────────────
 def create_activity_log(
-    db: Session, user_id: str, user_name: str, action: str,
+    db: Session, user_id: str, user_name: str, action_key: str,
     log_type: str = "general", related_id: str = None,
+    request: Request = None,
+    **kwargs
 ):
-    # NOTE: the activity_logs table has no details/center_id columns;
-    # extra context must be folded into the action text by the caller.
+    # Ensure user_name is not None to avoid IntegrityError (NOT NULL constraint)
+    safe_user_name = user_name or "Unknown User"
+
+    # Translate the action text using the provided key and dynamic arguments
+    action_text = get_text(action_key, request) if request else action_key
+    if kwargs:
+        try:
+            action_text = action_text.format(**kwargs)
+        except KeyError:
+            pass
+
     db.add(models.ActivityLog(
-        user_id=user_id, user_name=user_name,
-        action=action, log_type=log_type,
+        user_id=user_id, user_name=safe_user_name,
+        action=action_text, log_type=log_type,
         related_id=related_id,
     ))
     db.commit()
@@ -137,7 +180,7 @@ def generate_next_reference_code(db: Session, prefix: str) -> str:
             db.commit()
         except Exception:
             db.rollback() # Someone else inserted it first
-            
+
     # Atomic increment and return using RETURNING clause
     stmt = text("UPDATE system_counters SET value = value + 1 WHERE key = 'global_reference' RETURNING value")
     new_val = db.execute(stmt).scalar()
@@ -166,35 +209,47 @@ def dispatch_notification_sync(
         "is_read": False, "created_at": new_notif.created_at.isoformat()
     }
 
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(manager.send_notification(json.dumps(payload), user_id))
-        loop.create_task(redis_manager.publish(NOTIFICATION_CHANNEL, payload))
-    except RuntimeError:
-        pass
-
+    # IMPORTANT: All DB operations MUST happen before launching background tasks
+    # to avoid SQLite threading errors.
+    fcm_tokens = []
     try:
         import firebase_admin
         try:
             firebase_admin.get_app()
         except ValueError:
             logger.debug("FCM not initialized - skipping push notification")
-            return
-        from firebase_admin import messaging
-        tokens = db.query(models.FCMToken).filter(models.FCMToken.user_id == user_id).all()
-        if tokens:
-            msg_fcm = messaging.MulticastMessage(
-                notification=messaging.Notification(title=title, body=message),
-                data={"related_id": str(related_id or ""), "type": type},
-                tokens=[t.token for t in tokens],
-            )
-            response = messaging.send_each_for_multicast(msg_fcm)
-            for idx, result in enumerate(response.responses):
-                if not result.success and "UNREGISTERED" in str(result.exception).upper():
-                    db.query(models.FCMToken).filter(models.FCMToken.token == tokens[idx].token).delete()
-            db.commit()
+        else:
+            from firebase_admin import messaging
+            tokens_objs = db.query(models.FCMToken).filter(models.FCMToken.user_id == user_id).all()
+            fcm_tokens = [t.token for t in tokens_objs]
     except Exception as e:
-        logger.error("FCM error: %s", e)
+        logger.error("FCM setup error: %s", e)
+
+    try:
+        loop = asyncio.get_running_loop()
+        # WebSocket and Redis notifications
+        loop.create_task(manager.send_notification(json.dumps(payload), user_id))
+        loop.create_task(redis_manager.publish(NOTIFICATION_CHANNEL, payload))
+
+        # FCM push notification (as a background task to avoid blocking)
+        if fcm_tokens:
+            async def send_fcm():
+                try:
+                    from firebase_admin import messaging
+                    msg_fcm = messaging.MulticastMessage(
+                        notification=messaging.Notification(title=title, body=message),
+                        data={"related_id": str(related_id or ""), "type": type},
+                        tokens=fcm_tokens,
+                    )
+                    response = messaging.send_each_for_multicast(msg_fcm)
+                    # Note: Clean-up of UNREGISTERED tokens here would require a new DB session
+                    # since the request session might be closed.
+                except Exception as e:
+                    logger.error("FCM send error: %s", e)
+
+            loop.create_task(send_fcm())
+    except RuntimeError:
+        pass
 
 
 # ──────────────────────────────────────────────
@@ -208,10 +263,15 @@ async def store_file_locally(file_bytes: bytes, mime_type: str, subdir: str, old
 
     ext = mime_type.split("/")[-1].replace("jpeg", "jpg")
     filename = f"{uuid4().hex}.{ext}"
+
+    # Store path relative to the app root for StaticFiles mount
     local_path = f"/uploads/{subdir}/{filename}"
 
-    os.makedirs(f"uploads/{subdir}", exist_ok=True)
-    with open(f"uploads/{subdir}/{filename}", "wb") as f:
+    # Actual path on disk
+    disk_path = os.path.join("uploads", subdir, filename)
+
+    os.makedirs(os.path.dirname(disk_path), exist_ok=True)
+    with open(disk_path, "wb") as f:
         f.write(file_bytes)
 
     sf = models.StoredFile(
@@ -225,6 +285,9 @@ async def store_file_locally(file_bytes: bytes, mime_type: str, subdir: str, old
     if old_url:
         old_fn = old_url.lstrip("/")
         if os.path.exists(old_fn):
-            os.remove(old_fn)
+            try:
+                os.remove(old_fn)
+            except OSError:
+                pass
 
     return {"stored_file": sf, "local_path": local_path}

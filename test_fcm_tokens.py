@@ -94,9 +94,11 @@ def test_fcm_token_lifecycle():
     count_a = db.query(models.FCMToken).filter(models.FCMToken.user_id == user_a.id).count()
     assert count_a == 0 # User A no longer has this token
 
-    # 4. User B logs out, deletes token
-    res = client.delete(f"/users/me/fcm-tokens?token={test_fcm_token}", headers=headers_b)
+    # 4. User B logs out, deletes token with Arabic Accept-Language
+    headers_b_ar = {"Authorization": f"Bearer {token_b}", "Accept-Language": "ar"}
+    res = client.delete(f"/users/me/fcm-tokens?token={test_fcm_token}", headers=headers_b_ar)
     assert res.status_code == 200
+    assert res.json()["message"] == "تم الحذف بنجاح"
     
     db = TestingSessionLocal()
     count = db.query(models.FCMToken).filter(models.FCMToken.token == test_fcm_token).count()

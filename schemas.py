@@ -686,6 +686,7 @@ class TaskBase(BaseModel):
     target_id: Optional[str] = None
     target_name: Optional[str] = None
     product_id: Optional[str] = None
+    product_name: Optional[str] = None
     quantity_target: Optional[int] = None
     due_date: Optional[datetime] = None
     status: str = 'pending'
@@ -696,6 +697,8 @@ class TaskBase(BaseModel):
     scheduled_datetime: Optional[datetime] = None
     rejection_report: Optional[str] = None
     reminder_offset: Optional[str] = None
+    visit_started_at: Optional[datetime] = None
+    visit_completed_at: Optional[datetime] = None
 
 class TaskCreate(TaskBase):
     pass
@@ -710,6 +713,8 @@ class TaskUpdate(BaseModel):
     reminder_offset: Optional[str] = None
     accepted_at: Optional[datetime] = None
     visit_id: Optional[str] = None
+    visit_started_at: Optional[datetime] = None
+    visit_completed_at: Optional[datetime] = None
 
 class TaskResponse(TaskBase):
     id: str
@@ -759,6 +764,7 @@ class BrandActivityLogBase(BaseModel):
     activity_type: Optional[str] = None
     target_type: Optional[str] = None
     target_id: Optional[str] = None
+    target_name: Optional[str] = None
     notes: Optional[str] = None
     status: str = 'completed'
 

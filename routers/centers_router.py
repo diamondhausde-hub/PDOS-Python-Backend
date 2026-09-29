@@ -1,9 +1,10 @@
 """routers/centers_router.py — /centers/*"""
 import datetime
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from routers.deps import get_text
 
 import models, schemas, auth
 from database import get_db
@@ -32,12 +33,13 @@ def create_center(
     payload: schemas.CenterCreate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if current_user.role in ("admin", "general_manager"):
-        raise HTTPException(status_code=403, detail="Only supervisors and reps can create centers")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized_create_center", request))
     brand_id = current_user.brand_id
     if not brand_id:
-        raise HTTPException(status_code=422, detail="Your account has no brand assigned")
+        raise HTTPException(status_code=422, detail=get_text("account_no_brand", request))
 
     if payload.latitude and payload.longitude:
         existing = db.query(models.Center).filter(
@@ -66,7 +68,7 @@ def create_center(
     db.commit()
     db.refresh(new_center)
     
-    create_activity_log(db, current_user.id, current_user.full_name, f"Added a new center: {new_center.name}", "user", new_center.id)
+    create_activity_log(db, current_user.id, current_user.full_name, "log_added_center", request=request, name=new_center.name)
     
     return new_center
 
@@ -77,12 +79,13 @@ def update_center(
     payload: schemas.CenterUpdate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Not authorized to update centers")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized_update_centers", request))
     center = db.query(models.Center).filter(models.Center.id == center_id).first()
     if not center:
-        raise HTTPException(status_code=404, detail="Center not found")
+        raise HTTPException(status_code=404, detail=get_text("center_not_found", request))
     if payload.name is not None: center.name = payload.name
     if payload.region is not None: center.region = payload.region
     if payload.latitude is not None: center.latitude = payload.latitude
@@ -100,15 +103,16 @@ def delete_center(
     center_id: str,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Not authorized to delete centers")
+        raise HTTPException(status_code=403, detail=get_text("not_authorized_delete_centers", request))
     center = db.query(models.Center).filter(models.Center.id == center_id).first()
     if not center:
-        raise HTTPException(status_code=404, detail="Center not found")
+        raise HTTPException(status_code=404, detail=get_text("center_not_found", request))
     center.is_active = False
     db.commit()
-    return {"message": "Center deleted successfully"}
+    return {"message": get_text("success_delete", request)}
 
 
 @router.post("/centers/{center_id}/report")
@@ -117,23 +121,24 @@ def report_center(
     payload: schemas.NoteCreate,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     center = db.query(models.Center).filter(models.Center.id == center_id).first()
     if not center:
-        raise HTTPException(status_code=404, detail="Center not found")
+        raise HTTPException(status_code=404, detail=get_text("center_not_found", request))
     # NOTE: centers have a plain name (doctor_name/facility_name live on Client)
     name = center.name or "Unnamed center"
     if current_user.supervisor_id:
         dispatch_notification_sync(
             db, user_id=current_user.supervisor_id, type="center_report",
-            title=f"تقرير عن مركز من {current_user.full_name}",
+            title=get_text("center_report_title", request).format(name=current_user.full_name),
             message=f"{name}: {payload.content}", related_id=center_id,
         )
     create_activity_log(
         db, user_id=current_user.id, user_name=current_user.full_name,
         action=f"Center Report — {name}: {payload.content}",
     )
-    return {"message": "Report sent successfully"}
+    return {"message": get_text("success_create", request)}
 
 
 @router.get("/centers/coverage", response_model=List[schemas.CenterCoverageResponse])
@@ -185,10 +190,11 @@ def get_center(
     center_id: str,
     current_user: models.User = Depends(auth.require_password_set),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     center = db.query(models.Center).filter(models.Center.id == center_id, models.Center.is_active == True).first()
     if not center:
-        raise HTTPException(status_code=404, detail="Center not found")
+        raise HTTPException(status_code=404, detail=get_text("center_not_found", request))
     if current_user.brand_id and center.brand_id != current_user.brand_id:
-        raise HTTPException(status_code=403, detail="Center belongs to a different brand")
+        raise HTTPException(status_code=403, detail=get_text("center_brand_mismatch", request))
     return center

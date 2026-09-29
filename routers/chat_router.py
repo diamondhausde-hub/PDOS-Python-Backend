@@ -1,8 +1,9 @@
 """routers/chat_router.py — Proxy to NVIDIA API (moonshotai/kimi-k3) with SSE streaming."""
 import os
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse, JSONResponse
+from routers.deps import get_text
 
 router = APIRouter()
 
@@ -16,11 +17,11 @@ def root():
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(data: dict):
+async def chat_completions(data: dict, request: Request = None):
     if not NVIDIA_API_KEY:
         return JSONResponse(
             status_code=500,
-            content={"error": "NVIDIA_API_KEY not configured"},
+            content={"error": get_text("api_key_not_configured", request)},
         )
 
     headers = {

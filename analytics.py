@@ -288,8 +288,18 @@ def get_system_overview(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_password_set)
 ):
-    if current_user.role not in ("admin", "general_manager"):
+    if current_user.role not in ("admin", "general_manager", "supervisor", "overseer", "rep"):
         raise HTTPException(status_code=403, detail="Not authorized")
+
+    if current_user.role in ("supervisor", "rep"):
+        assigned_brands = set(current_user.brand_ids)
+        if current_user.brand_id:
+            assigned_brands.add(current_user.brand_id)
+        if assigned_brands:
+            if brand_id and brand_id not in assigned_brands:
+                brand_id = current_user.brand_id or next(iter(assigned_brands))
+            elif not brand_id and len(assigned_brands) == 1:
+                brand_id = next(iter(assigned_brands))
 
     today = datetime.date.today()
     first_of_month = today.replace(day=1)
@@ -297,7 +307,7 @@ def get_system_overview(
     total_revenue = calculate_revenue(db, first_of_month, today, brand_id=brand_id)
     
     users_q = db.query(models.User)
-    centers_q = db.query(models.Center)
+    centers_q = db.query(models.Center).filter(models.Center.is_active == True)
     products_q = db.query(models.Product)
     low_stock_q = db.query(models.Product).filter(models.Product.stock_qty <= models.Product.min_threshold)
     
@@ -313,24 +323,42 @@ def get_system_overview(
     
     visits_today_q = db.query(models.Visit).filter(func.date(models.Visit.visit_date) == today)
     if brand_id:
-        visits_today_q = visits_today_q.join(models.User, models.Visit.rep_id == models.User.id).filter(models.User.brand_id == brand_id)
+        visits_today_q = visits_today_q.filter(
+            (models.Visit.brand_id == brand_id) |
+            (models.Visit.rep_id.in_(db.query(models.User.id).filter(models.User.brand_id == brand_id)))
+        )
     visits_today = visits_today_q.count()
     
     low_stock_count = low_stock_q.count()
-    pending_appointments = db.query(models.Appointment).filter(models.Appointment.status == "pending").count()
+
+    pending_appts_q = db.query(models.Appointment).filter(models.Appointment.status == "pending")
+    if brand_id:
+        pending_appts_q = pending_appts_q.join(models.User, models.Appointment.rep_id == models.User.id).filter(models.User.brand_id == brand_id)
+    pending_appointments = pending_appts_q.count()
 
     region_coverage = []
-    for region_row in db.query(models.Center.region).distinct():
+    region_query = db.query(models.Center.region).filter(models.Center.is_active == True).distinct()
+    if brand_id:
+        region_query = region_query.filter(models.Center.brand_id == brand_id)
+    for region_row in region_query:
         region_name = region_row[0]
         if not region_name:
             continue
             
-        region_total_centers = db.query(models.Center).filter(models.Center.region == region_name).count()
-        visited = db.query(models.Visit).join(models.Center).filter(
+        region_total_centers_q = db.query(models.Center).filter(models.Center.region == region_name, models.Center.is_active == True)
+        if brand_id:
+            region_total_centers_q = region_total_centers_q.filter(models.Center.brand_id == brand_id)
+        region_total_centers = region_total_centers_q.count()
+
+        visited_q = db.query(func.count(func.distinct(models.Visit.center_id))).join(models.Center).filter(
             models.Center.region == region_name,
+            models.Center.is_active == True,
             models.Visit.status == "completed",
             func.date(models.Visit.visit_date) >= today.replace(day=1)
-        ).distinct(models.Visit.center_id).count()
+        )
+        if brand_id:
+            visited_q = visited_q.filter(models.Center.brand_id == brand_id)
+        visited = visited_q.scalar() or 0
         
         pct = round((visited / region_total_centers) * 100, 1) if region_total_centers else 0.0
         region_coverage.append(schemas.RegionCoverage(

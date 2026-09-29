@@ -26,13 +26,13 @@ def test_review_flagged_visit():
     # Create brand, product and appointment
     brand = Brand(id="brand1", name="Test Brand")
     prod = Product(id="prod1", name="Product 1", price=10.0, category="Test", stock_qty=100, brand_id="brand1")
-    appt = Appointment(id="appt1", rep_id="rep1", center_id="c1", appt_date=datetime.datetime.utcnow(), appt_time="10:00", status="done")
+    appt = Appointment(id="appt1", rep_id="rep1", center_id="c1", appt_date=datetime.datetime.now(datetime.timezone.utc), appt_time="10:00", status="done")
     
     db.add_all([admin, supervisor1, supervisor2, rep1, brand, prod, appt])
     db.commit()
     
     # Create a flagged visit
-    date = datetime.datetime.utcnow()
+    date = datetime.datetime.now(datetime.timezone.utc)
     v1 = Visit(id="v1", rep_id="rep1", center_id="c1", appointment_id="appt1", visit_date=date, status="flagged")
     db.add(v1)
     db.commit()

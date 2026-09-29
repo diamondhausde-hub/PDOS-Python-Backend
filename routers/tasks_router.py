@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_, func
 from typing import List, Optional
 import datetime
 from datetime import timedelta
+from routers.deps import get_text
 
 from database import get_db
 import models
@@ -27,8 +28,10 @@ def _get_brand_color(brand) -> str:
 def _enrich_task(task) -> dict:
     """Convert a Task ORM object to a dict enriched with names/colors."""
     d = {c.name: getattr(task, c.name) for c in task.__table__.columns}
-    d["rep_name"] = task.rep.full_name if task.rep else "غير معروف"
-    d["brand_name"] = task.brand.name if task.brand else "غير معروف"
+    # Using a placeholder for "Unknown" since enrichment doesn't have Request context.
+    # These are often handled by the frontend or we could pass request down.
+    d["rep_name"] = task.rep.full_name if task.rep else get_text("unknown", None)
+    d["brand_name"] = task.brand.name if task.brand else get_text("unknown", None)
     d["brand_color"] = _get_brand_color(task.brand)
     d["supervisor_name"] = task.supervisor.full_name if task.supervisor else None
     return d
@@ -81,12 +84,13 @@ def create_task(
     task: schemas.TaskCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
+    request: Request = None,
 ):
     """Create a new task. Supervisor/GM only."""
     if current_user.role not in ("supervisor", "general_manager", "admin"):
-        raise HTTPException(403, "Only supervisors and managers can create tasks")
+        raise HTTPException(403, get_text("not_authorized_tasks", request))
 
-    db_task = models.Task(**task.dict())
+    db_task = models.Task(**task.model_dump())
     if not db_task.supervisor_id:
         db_task.supervisor_id = current_user.id
     if not db_task.brand_id:
@@ -98,7 +102,7 @@ def create_task(
 
     _log_history(db, db_task.id, "created", current_user.id,
                  new_status=db_task.status,
-                 note=f"Task assigned to rep")
+                 note=get_text("log_task_assigned", request) if request else "Task assigned to rep")
 
     db.commit()
 
@@ -140,48 +144,99 @@ def update_task(
     task_update: schemas.TaskUpdate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
+    request: Request = None,
 ):
     """Update a task's status, notes, or priority."""
     db_task = db.query(models.Task).filter(
-        models.Task.id == task_id, 
+        models.Task.id == task_id,
         models.Task.is_deleted == False
     ).first()
 
     if not db_task:
-        raise HTTPException(404, "Task not found")
+        raise HTTPException(404, get_text("task_not_found", request))
 
     # Role check: rep can only update their own tasks
     if current_user.role == "rep" and db_task.rep_id != current_user.id:
-        raise HTTPException(403, "You can only update your own tasks")
+        raise HTTPException(403, get_text("not_authorized_task_update", request))
 
     old_status = db_task.status
+    if old_status == 'new':
+        old_status = 'pending'
+    elif old_status == 'done':
+        old_status = 'completed'
+    elif old_status == 'accepted':
+        old_status = 'accepted_scheduled'
 
-    if task_update.status is not None and task_update.status != old_status:
-        if task_update.status == 'rejected' and not task_update.rejection_report:
-            raise HTTPException(422, "rejection_report is required when rejecting a task")
+    if task_update.status is not None:
+        new_status = task_update.status
+        if new_status == 'done':
+            new_status = 'completed'
+            task_update.status = 'completed'
+        elif new_status == 'accepted':
+            new_status = 'accepted_scheduled'
+            task_update.status = 'accepted_scheduled'
 
-        db_task.status = task_update.status
-        if task_update.status in ["done", "completed"]:
+        if new_status != old_status:
+            # Valid state transitions
+            valid_transitions = {
+                'pending': ['accepted_scheduled', 'rejected'],
+                'accepted_scheduled': ['in_progress', 'upcoming', 'overdue', 'completed'],
+                'scheduled': ['in_progress', 'upcoming', 'overdue', 'completed'],
+                'upcoming': ['in_progress', 'overdue', 'completed'],
+                'in_progress': ['completed', 'abandoned'],
+                'abandoned': ['in_progress'],
+                'overdue': ['in_progress', 'abandoned', 'completed'],
+                'rejected': [],
+                'completed': [],
+            }
+
+            if old_status in valid_transitions and new_status not in valid_transitions[old_status]:
+                raise HTTPException(422, get_text("invalid_task_transition", request).format(old=old_status, new=new_status))
+
+        if new_status == 'rejected' and not task_update.rejection_report:
+            raise HTTPException(422, get_text("rejection_report_required", request))
+            
+        if new_status == 'in_progress':
+            db_task.visit_started_at = datetime.datetime.now(datetime.timezone.utc)
+
+        if new_status == "completed":
+            if old_status not in ('in_progress', 'completed'):
+                raise HTTPException(422, "Task must be in_progress before it can be completed")
+                    
+            db_task.visit_completed_at = task_update.visit_completed_at or db_task.visit_completed_at or datetime.datetime.now(datetime.timezone.utc)
+
             if not db_task.completed_at:
-                db_task.completed_at = datetime.datetime.utcnow()
+                db_task.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                if db_task.task_type != 'visit':
+                    db.add(models.BrandActivityLog(
+                        rep_id=db_task.rep_id,
+                        brand_id=db_task.brand_id,
+                        task_id=db_task.id,
+                        activity_type='task_completed',
+                        target_type=db_task.target_type,
+                        target_id=db_task.target_id,
+                        target_name=db_task.target_name,
+                        notes=task_update.progress_note or db_task.progress_note
+                    ))
         else:
             db_task.completed_at = None
             
-        if task_update.status == "accepted":
-            db_task.accepted_at = datetime.datetime.utcnow()
+        if new_status == "accepted_scheduled":
+            db_task.accepted_at = datetime.datetime.now(datetime.timezone.utc)
 
+        db_task.status = task_update.status
         _log_history(db, task_id, "status_changed", current_user.id,
                      old_status=old_status, new_status=task_update.status)
 
     if task_update.progress_note is not None and task_update.progress_note != db_task.progress_note:
         db_task.progress_note = task_update.progress_note
         _log_history(db, task_id, "updated", current_user.id,
-                     note=f"Progress note updated")
+                     note=get_text("log_progress_updated", request) if request else "Progress note updated")
 
     if task_update.priority is not None and task_update.priority != db_task.priority:
         db_task.priority = task_update.priority
         _log_history(db, task_id, "updated", current_user.id,
-                     note=f"Priority changed to {task_update.priority}")
+                     note=get_text("log_priority_changed", request, priority=task_update.priority) if request else f"Priority changed to {task_update.priority}")
 
     if task_update.notes is not None:
         db_task.notes = task_update.notes
@@ -212,6 +267,7 @@ def delete_task(
     task_id: str,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
+    request: Request = None,
 ):
     """Soft-delete a task. Supervisor/GM/Admin only."""
     task = db.query(models.Task).filter(
@@ -219,14 +275,14 @@ def delete_task(
         models.Task.is_deleted == False,
     ).first()
     if not task:
-        raise HTTPException(404, "Task not found")
+        raise HTTPException(404, get_text("task_not_found", request))
 
     if current_user.role not in ("supervisor", "general_manager", "admin"):
-        raise HTTPException(403, "Only supervisors and managers can delete tasks")
+        raise HTTPException(403, get_text("not_authorized_tasks", request))
 
     task.is_deleted = True
     _log_history(db, task_id, "deleted", current_user.id,
-                 old_status=task.status, note="Task deleted")
+                 old_status=task.status, note=get_text("log_task_deleted", request) if request else "Task deleted")
     db.commit()
     return {"ok": True}
 
@@ -283,11 +339,11 @@ def search_targets(
             client_query = client_query.filter(models.Client.brand_id == current_user.brand_id)
 
         for c in client_query.limit(10).all():
-            name = c.doctor_name or c.facility_name or "Unknown"
+            name = c.doctor_name or c.facility_name or get_text("unknown", None)
             results.append({
                 "id": c.id,
                 "name": name,
-                "type": c.client_type or "doctor",
+                "type": c.client_type or get_text("doctor", None),
                 "region": c.region,
             })
 
@@ -318,8 +374,9 @@ def create_activity_log(
     log: schemas.BrandActivityLogCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
+    request: Request = None,
 ):
-    db_log = models.BrandActivityLog(**log.dict())
+    db_log = models.BrandActivityLog(**log.model_dump())
     if not db_log.rep_id:
         db_log.rep_id = current_user.id
     db.add(db_log)
@@ -330,10 +387,10 @@ def create_activity_log(
         if task and task.status != 'done':
             old = task.status
             task.status = 'done'
-            task.completed_at = datetime.datetime.utcnow()
+            task.completed_at = datetime.datetime.now(datetime.timezone.utc)
             _log_history(db, task.id, "status_changed", current_user.id,
                          old_status=old, new_status="done",
-                         note="Auto-completed via activity log")
+                         note=get_text("log_auto_completed", request) if request else "Auto-completed via activity log")
 
     db.commit()
     db.refresh(db_log)
@@ -373,7 +430,7 @@ def get_activity_logs(
         query = query.filter(models.BrandActivityLog.rep_id == rep_id)
 
     if date_filter:
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         if date_filter == 'today':
             query = query.filter(models.BrandActivityLog.logged_at >= now.date())
         elif date_filter == 'week':

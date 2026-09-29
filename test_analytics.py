@@ -23,7 +23,7 @@ def test_analytics_scoping():
     db.commit()
     
     # Create test visits
-    date = datetime.datetime.utcnow()
+    date = datetime.datetime.now(datetime.timezone.utc)
     v1 = Visit(id="v1", rep_id="rep1", center_id="c1", visit_date=date, status="done")
     v2 = Visit(id="v2", rep_id="rep2", center_id="c2", visit_date=date, status="done")
     db.add_all([v1, v2])
